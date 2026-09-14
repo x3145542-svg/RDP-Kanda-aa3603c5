@@ -1,0 +1,165 @@
+name: Kanda RDP (Railway Bridge)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bridge_url:
+        description: "Railway bridge WebSocket URL (wss://.../ws)"
+        required: true
+      quick_test:
+        description: "Run 5-minute test"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Runtime (max 360; default 355)"
+        required: false
+        default: "355"
+      rdp_count:
+        description: "How many RDP instances (1-2)"
+        required: false
+        default: "1"
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        run: |
+          $n = [int]"${{ inputs.rdp_count }}"; if ($n -lt 1) { $n = 1 }; if ($n -gt 2) { $n = 2 }
+          $inc = @(); for ($i=1; $i -le $n; $i++){ $inc += @{ id = $i } }
+          "matrix=$(@{ include = $inc } | ConvertTo-Json -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 2
+    timeout-minutes: 370
+    env:
+      RDP_USER: Kandagawa
+      RDP_PASS: Kandagw@12345
+      BRIDGE_WS: ${{ inputs.bridge_url }}
+    steps:
+
+      - name: Decide hostname
+        run: |
+          if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "kanda${{ matrix.id }}" } else { $hn = "kanda" }
+          "RDP_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Hostname: $hn"
+
+      - name: Enable RDP user + firewall
+        run: |
+          $secFile = "$env:TEMP\secedit.cfg"; $secNew = "$env:TEMP\secedit_new.cfg"
+          secedit /export /cfg $secFile /quiet 2>$null
+          if (Test-Path $secFile) {
+            (Get-Content $secFile) -replace 'PasswordComplexity = 1','PasswordComplexity = 0' -replace 'MinimumPasswordLength = \d+','MinimumPasswordLength = 0' | Set-Content $secNew
+            secedit /configure /db secedit.sdb /cfg $secNew /quiet 2>$null
+          }
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Tune RDP + graphics performance
+        run: |
+          try {
+            # 1) Tắt hiệu ứng hình ảnh (Visual Effects) -> giảm tải render software
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+            # 2) Tối ưu RDP cho tốc độ (bỏ theme, animation, font smoothing trong phiên RDP)
+            reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fAllowFontSmoothing /t REG_DWORD /d 0 /f | Out-Null
+            reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fDisableAnimations /t REG_DWORD /d 1 /f | Out-Null
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations" /v AllowFontSmoothing /t REG_DWORD /d 0 /f | Out-Null
+            # 3) Ưu tiên hiệu năng nền (thay vì ứng dụng nền)
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl" /v Win32PrioritySeparation /t REG_DWORD /d 38 /f | Out-Null
+            # 4) Bật GPU scheduling / giảm latency (không có GPU thật nhưng vẫn giúp software render)
+            reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v HwSchMode /t REG_DWORD /d 2 /f | Out-Null
+            # 5) Tắt Windows Defender realtime (giải phóng CPU ~30%)
+            Set-MpPreference -DisableRealtimeMonitoring $true -EA SilentlyContinue
+            Set-MpPreference -DisableBehaviorMonitoring $true -EA SilentlyContinue
+            Set-MpPreference -DisableScanOnRealtimeEnable $true -EA SilentlyContinue
+            Set-MpPreference -DisableIOAVProtection $true -EA SilentlyContinue
+            Stop-Service -Name WinDefend -Force -EA SilentlyContinue
+            Stop-Service -Name WdNisSvc -Force -EA SilentlyContinue
+            # 6) Tắt các service nền không cần thiết
+            $svcs = @("AzureArcSysTray","bfe","DiagTrack","WSearch","SysMain","DPS","TabletInputService","WMPNetworkSvc")
+            foreach($svc in $svcs){ Stop-Service -Name $svc -Force -EA SilentlyContinue; Set-Service -Name $svc -StartupType Disabled -EA SilentlyContinue }
+            # 7) Tắt transparency
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+            Write-Host "[+] RDP + graphics performance tuned"
+          } catch { Write-Host ("[!] Tune lỗi: " + $_.Exception.Message) }
+
+      - name: Remove bloatware + desktop shortcuts (Unity Hub, R)
+        run: |
+          Stop-Process -Name "Unity Hub" -Force -EA SilentlyContinue
+          Stop-Process -Name "unityhub" -Force -EA SilentlyContinue
+          Stop-Process -Name "Rgui" -Force -EA SilentlyContinue
+          Stop-Process -Name "Rterm" -Force -EA SilentlyContinue
+          $dirs=@("$env:ProgramFiles\Unity Hub","$env:LOCALAPPDATA\Unity Hub","$env:APPDATA\UnityHub","$env:ProgramData\Unity Hub","$env:LOCALAPPDATA\Programs\Unity Hub")
+          foreach($x in $dirs){ if(Test-Path $x){ Remove-Item $x -Recurse -Force -EA SilentlyContinue } }
+          # Xoá shortcut .lnk trên Public Desktop + Desktop của user (nếu có) + Start Menu
+          $desktops = @("$env:PUBLIC\Desktop", "$env:PUBLIC\Public Desktop", "$env:USERPROFILE\Desktop")
+          $targets = @("Unity Hub", "R 4.6.1", "R 4.4", "Rgui")
+          foreach($d in $desktops){
+            if(Test-Path $d){
+              Get-ChildItem -Path $d -Filter *.lnk -EA SilentlyContinue | ForEach-Object {
+                $nm = $_.BaseName
+                foreach($t in $targets){ if($nm -like "*$t*"){ Remove-Item $_.FullName -Force -EA SilentlyContinue; Write-Host "[+] Xoá shortcut: $($_.Name)" } }
+              }
+            }
+          }
+          Write-Host "[+] Bloatware + shortcuts cleanup done"
+
+      - name: RDP READY — connection info
+        run: |
+          Write-Host ""
+          Write-Host "======================================================"
+          Write-Host "  RDP READY"
+          Write-Host "  Host    : $env:RDP_HOSTNAME"
+          Write-Host "  User    : $env:RDP_USER"
+          Write-Host "  Pass    : $env:RDP_PASS"
+          Write-Host "  Connect : dùng endpoint TCP Proxy từ Railway bridge"
+          Write-Host "  WS      : $env:BRIDGE_WS"
+          Write-Host "======================================================"
+          Write-Host ""
+
+      - name: Bridge to Railway + Keep alive (forever)
+        run: |
+          $ws = "$env:BRIDGE_WS"
+          Write-Host "Bridge WS target: $ws"
+
+          $code = "Ly8gS2FuZGEgUkRQIHJ1bm5lciByZWxheSB2MiDigJQgV1MoYnJpZGdlKSBwb29sIDwtPiBsYXp5IFRDUCAxMjcuMC4wLjE6MzM4OQovLyB2MiBmaXggbOG7l2kgMHg3ICJjb25uZWN0aW9uIHdhcyBsb3N0IjoKLy8gICAxLiBQb29sIDMgc2xvdCBXUyAtPiBjbGllbnQgbeG7m2kgbHXDtG4gY8OzIHNsb3QgcuG6o25oIG5nYXksIGtow7RuZyBjw7JuIGdhcCAzcwovLyAgIDIuIExBWlkgZGlhbDogY2jhu4kgZGlhbCAxMjcuMC4wLjE6MzM4OSBraGkgbmjhuq1uIGJ5dGUgxJDhuqZVIFRJw4pOIHThu6sgY2xpZW50Ci8vICAgICAgKG1zdHNjIGx1w7RuIGfhu61pIFguMjI0IENvbm5lY3Rpb24gUmVxdWVzdCB0csaw4bubYyAtPiBzb2NrZXQgdOG7m2kgUkRQIGx1w7RuIHTGsMahaSkKLy8gICAzLiBQaW5nL3BvbmcgMjBzIHThu6sgY2xpZW50IC0+IHBow6F0IGhp4buHbiBXUyBjaOG6v3QgKFJhaWx3YXkgZ2nhur90IGlkbGUgV1MpIHRyb25nIDEgY2h1IGvhu7MKLy8gICAgICB2w6AgcmVzcGF3biBzbG90LCB0aGF5IHbDrCBuZ+G7k2kgdHLDqm4gV1MgaGFsZi1vcGVuIG3Do2kgbmjGsCB2MQpjb25zdCBXZWJTb2NrZXQgPSByZXF1aXJlKCd3cycpOwpjb25zdCBuZXQgPSByZXF1aXJlKCduZXQnKTsKCmNvbnN0IFdTX1VSTCA9IHByb2Nlc3MuYXJndlsyXSB8fCBwcm9jZXNzLmVudi5CUklER0VfV1M7CmNvbnN0IExPQ0FMX1BPUlQgPSBwYXJzZUludChwcm9jZXNzLmFyZ3ZbM10gfHwgcHJvY2Vzcy5lbnYuUkRQX0xPQ0FMX1BPUlQgfHwgJzMzODknLCAxMCk7CmNvbnN0IFBPT0xfU0laRSA9IHBhcnNlSW50KHByb2Nlc3MuZW52LlBPT0xfU0laRSB8fCAnMycsIDEwKTsKY29uc3QgUElOR19NUyA9IDIwMDAwOwoKaWYgKCFXU19VUkwpIHsgY29uc29sZS5lcnJvcignW3JlbGF5XSBubyBXU19VUkwnKTsgcHJvY2Vzcy5leGl0KDEpOyB9CmNvbnNvbGUubG9nKCdbcmVsYXldIHYyIFdTPScgKyBXU19VUkwgKyAnIGxvY2FsPScgKyBMT0NBTF9QT1JUICsgJyBwb29sPScgKyBQT09MX1NJWkUpOwoKZnVuY3Rpb24gc3Bhd25TbG90KCkgewogIGNvbnN0IHdzID0gbmV3IFdlYlNvY2tldChXU19VUkwpOwogIGxldCBzb2NrID0gbnVsbDsKICBsZXQgZGlhbGluZyA9IGZhbHNlOwogIGNvbnN0IHBlbmRpbmcgPSBbXTsKICB3cy5fYWxpdmUgPSB0cnVlOwoKICB3cy5vbignb3BlbicsICgpID0+IHsgY29uc29sZS5sb2coJ1tyZWxheV0gc2xvdCByZWFkeScpOyB3cy5fYWxpdmUgPSB0cnVlOyB9KTsKICB3cy5vbigncG9uZycsICgpID0+IHsgd3MuX2FsaXZlID0gdHJ1ZTsgfSk7CgogIGNvbnN0IGhiID0gc2V0SW50ZXJ2YWwoKCkgPT4gewogICAgaWYgKHdzLnJlYWR5U3RhdGUgIT09IFdlYlNvY2tldC5PUEVOKSB7IGNsZWFySW50ZXJ2YWwoaGIpOyByZXR1cm47IH0KICAgIGlmICghd3MuX2FsaXZlKSB7IGNvbnNvbGUubG9nKCdbcmVsYXldIHNsb3Q6IG5vIHBvbmcgLT4gdGVybWluYXRlICsgcmVzcGF3bicpOyBjbGVhckludGVydmFsKGhiKTsgdHJ5IHsgd3MudGVybWluYXRlKCk7IH0gY2F0Y2ggKGUpIHt9IHJldHVybjsgfQogICAgd3MuX2FsaXZlID0gZmFsc2U7CiAgICB0cnkgeyB3cy5waW5nKCk7IH0gY2F0Y2ggKGUpIHt9CiAgfSwgUElOR19NUyk7CgogIHdzLm9uKCdtZXNzYWdlJywgKGRhdGEpID0+IHsKICAgIGNvbnN0IGJ1ZiA9IEJ1ZmZlci5pc0J1ZmZlcihkYXRhKSA/IGRhdGEgOiBCdWZmZXIuZnJvbShkYXRhKTsKICAgIGlmIChzb2NrICYmICFzb2NrLmRlc3Ryb3llZCkgeyB0cnkgeyBzb2NrLndyaXRlKGJ1Zik7IH0gY2F0Y2ggKGUpIHt9IHJldHVybjsgfQogICAgaWYgKGRpYWxpbmcpIHsgcGVuZGluZy5wdXNoKGJ1Zik7IHJldHVybjsgfQogICAgZGlhbGluZyA9IHRydWU7CiAgICBwZW5kaW5nLnB1c2goYnVmKTsKICAgIGNvbnNvbGUubG9nKCdbcmVsYXldIGNsaWVudCBhcnJpdmVkIC0+IGRpYWwgMTI3LjAuMC4xOicgKyBMT0NBTF9QT1JUKTsKICAgIHNvY2sgPSBuZXQuY29ubmVjdChMT0NBTF9QT1JULCAnMTI3LjAuMC4xJywgKCkgPT4gewogICAgICBjb25zb2xlLmxvZygnW3JlbGF5XSBUQ1AgMzM4OSB1cCwgZmx1c2hpbmcgJyArIHBlbmRpbmcubGVuZ3RoICsgJyBjaHVuayhzKScpOwogICAgICB3aGlsZSAocGVuZGluZy5sZW5ndGgpIHsgdHJ5IHsgc29jay53cml0ZShwZW5kaW5nLnNoaWZ0KCkpOyB9IGNhdGNoIChlKSB7fSB9CiAgICB9KTsKICAgIHNvY2sub24oJ2RhdGEnLCAoYikgPT4geyB0cnkgeyBpZiAod3MucmVhZHlTdGF0ZSA9PT0gV2ViU29ja2V0Lk9QRU4pIHdzLnNlbmQoYik7IH0gY2F0Y2ggKGUpIHt9IH0pOwogICAgc29jay5vbignZXJyb3InLCAoZSkgPT4geyBjb25zb2xlLmxvZygnW3JlbGF5XSB0Y3AgZXJyOiAnICsgZS5tZXNzYWdlKTsgdHJ5IHsgd3MuY2xvc2UoKTsgfSBjYXRjaCAoZTIpIHt9IH0pOwogICAgc29jay5vbignY2xvc2UnLCAoKSA9PiB7IHRyeSB7IHdzLmNsb3NlKCk7IH0gY2F0Y2ggKGUpIHt9IH0pOwogIH0pOwoKICB3cy5vbignY2xvc2UnLCAoKSA9PiB7CiAgICBjbGVhckludGVydmFsKGhiKTsKICAgIGlmIChzb2NrKSB7IHRyeSB7IHNvY2suZGVzdHJveSgpOyB9IGNhdGNoIChlKSB7fSBzb2NrID0gbnVsbDsgfQogICAgY29uc29sZS5sb2coJ1tyZWxheV0gc2xvdCBjbG9zZWQgLT4gcmVzcGF3biBpbiAxLjVzJyk7CiAgICBzZXRUaW1lb3V0KHNwYXduU2xvdCwgMTUwMCk7CiAgfSk7CiAgd3Mub24oJ2Vycm9yJywgKGUpID0+IGNvbnNvbGUubG9nKCdbcmVsYXldIHdzIGVycjogJyArIGUubWVzc2FnZSkpOwp9Cgpmb3IgKGxldCBpID0gMDsgaSA8IFBPT0xfU0laRTsgaSsrKSBzcGF3blNsb3QoKTsKc2V0SW50ZXJ2YWwoKCkgPT4ge30sIDYwMDAwKTsK"
+          $relayFile = "$env:GITHUB_WORKSPACE\relay.js"
+          [IO.File]::WriteAllText($relayFile, [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($code)))
+          npm install ws --no-audit --no-fund 2>&1 | Out-Null
+          $env:BRIDGE_WS = $ws
+          Start-Process -FilePath "node" -ArgumentList $relayFile -WindowStyle Hidden -PassThru
+          Write-Host "[relay] started PID $($p.Id)"
+
+          $i = 0
+          while ($true) {
+            $i++
+            Write-Host ("[RDP] Heartbeat #$i " + (Get-Date).ToString('HH:mm:ss') + " | alive")
+            [Console]::Out.Flush()
+            Start-Sleep -Seconds 60
+          }
